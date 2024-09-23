@@ -1,10 +1,17 @@
 #!/bin/bash
 
-docker build -t faiss-perf .
+# docker build -t faiss-perf .
 
 docker rm $(docker ps --all -q -f status=exited)
 
 set -e
+
+emon_enable=0  # 设置为1时启用emon相关代码，设置为0时禁用
+
+if [ "$(cat /sys/kernel/mm/transparent_hugepage/enabled | grep -o '\[always\]')" != "[always]" ]; then \
+        echo "Transparent Huge Pages is not set to 'always'. Exiting..."; \
+        exit 1; \
+fi
 
 mkdir -p output
 rm -rf output/*
@@ -36,11 +43,13 @@ container_ids=()
 for cores in "${core_groups[@]}"; do
   # 启动容器，并获取容器 ID
   cid=$(docker run --cpuset-cpus="$cores" --memory="16g" \
-    --name "faiss-perf-$container_id" -d \
-    -v $(pwd)/output:/output \
-    -v /home/xtang/faiss-docker/faiss-1.8.0/tutorial/python/1-Flat.py:/home/app/faiss/tutorial/python/1-Flat.py \
-    faiss-perf \
-    sh -c "DNNL_ENABLE=${DNNL_ENABLE} python3 /home/app/faiss/tutorial/python/1-Flat.py > /output/${container_id}.log 2>&1")
+  --name "faiss-perf-$container_id" -d \
+  -v $(pwd)/output:/output \
+  -v $(pwd)/emon_data:/emon_data \
+  -v /home/xtang/faiss-docker/faiss-1.8.0/tutorial/python/1-Flat.py:/home/app/faiss/tutorial/python/1-Flat.py \
+  -e CONTAINER_ID="$container_id" \
+  faiss-perf \
+  sh -c "DNNL_ENABLE=${DNNL_ENABLE} python3 /home/app/faiss/tutorial/python/1-Flat.py > /output/${container_id}.log 2>&1")
 
   echo "Started container faiss-perf-$container_id with cores $cores and DNNL_ENABLE=${DNNL_ENABLE}"
 
@@ -50,16 +59,41 @@ for cores in "${core_groups[@]}"; do
   ((container_id++))
 done
 
+# 存储 docker wait 命令的 PID 的数组
+wait_pids=()
+
 # 等待所有容器完成
 for cid in "${container_ids[@]}"; do
   docker wait "$cid" &
+  # 获取后台进程的 PID
+  wait_pids+=("$!")
 done
 
+if [ "$emon_enable" -eq 1 ]; then
+  rm -rf emon_data/emr_socket_w_amx.xlsx
+  rm -rf summary.xlsx
+  rm -rf emon.dat
+  rm -rf *.csv
+  echo "start emon...."
+  emon -collect-edp > emon.dat &
+fi
+
 # 等待所有 docker wait 命令完成
-wait
+for pid in "${wait_pids[@]}"; do
+  wait "$pid"
+done
 
 # 记录结束时间
 end_time=$(date +%s)
+
+if [ "$emon_enable" -eq 1 ]; then
+  echo "stop emon...."
+  emon -stop
+  emon -process-pyedp /opt/intel/sep/config/edp/pyedp_config.txt
+  mv summary.xlsx emon_data/emr_socket_w_amx.xlsx
+  rm -rf emon.dat
+  rm -rf *.csv
+fi
 
 # 计算并输出运行总耗时
 duration=$((end_time - start_time))
